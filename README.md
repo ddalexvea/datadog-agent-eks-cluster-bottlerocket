@@ -228,6 +228,40 @@ kubectl exec -n datadog daemonset/datadog-agent -c system-probe -- kill -0 $NGIN
 
 ---
 
+## ❓ Does Upgrading Helm Chart / Agent Fix This?
+
+**No.** Upgrading to the latest versions does not automatically fix this issue.
+
+| Version | Tested | Auto-detects Bottlerocket? | Auto-applies seLinuxOptions? |
+|---------|--------|---------------------------|------------------------------|
+| Helm 3.85.0 / Agent 7.60.1 | ✅ Yes | ❌ No | ❌ No |
+| Helm 3.160.3 / Agent 7.x (latest) | ❌ No | ❌ No | ❌ No |
+
+### Why Upgrading Doesn't Help
+
+The Helm chart:
+- ✅ Provides `seLinuxOptions` as a configurable value
+- ✅ Configures seccomp to allow `kill -0`
+- ✅ Grants `CAP_KILL` capability
+- ❌ Does **NOT** auto-detect Bottlerocket nodes
+- ❌ Does **NOT** automatically apply `spc_t` SELinux type
+
+### The Gap
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Helm Chart (any version)         │  Bottlerocket SELinux       │
+├───────────────────────────────────┼─────────────────────────────┤
+│  ✅ CAP_KILL granted              │  ❌ MCS isolation blocks    │
+│  ✅ Seccomp allows kill -0        │  ❌ container_t restricted  │
+│  ❌ No seLinuxOptions by default  │  ← YOU MUST CONFIGURE THIS  │
+└───────────────────────────────────┴─────────────────────────────┘
+```
+
+> **Potential Feature Request:** The Helm chart could detect Bottlerocket nodes (via node labels or OS detection) and automatically apply appropriate SELinux settings.
+
+---
+
 ## ✅ Workaround: Apply seLinuxOptions
 
 ### Helm Values
