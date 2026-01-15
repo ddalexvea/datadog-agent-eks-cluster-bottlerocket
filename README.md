@@ -1,166 +1,193 @@
-# Bottlerocket SELinux - systemd/journald Access Denied
+# Bottlerocket SELinux + Datadog system-probe Sandbox
 
-## Context
+## 🎯 Issue Summary
 
-On EKS with Bottlerocket nodes, the Datadog Agent's `systemd` check fails with:
-```
-Error running check: error getting list of units: SELinux policy denies access: Permission denied
-```
+**system-probe** running as `container_t` with MCS labels is **blocked by SELinux** from inspecting other containers on Bottlerocket nodes.
 
-Bottlerocket enforces SELinux by default. Without explicit `seLinuxOptions` in the pod spec, the agent container cannot access host systemd D-Bus socket or journald files.
+This sandbox reproduces the issue and demonstrates the workaround using `seLinuxOptions`.
 
-**Related Tickets:** 2417402
+---
 
-## Environment
+## 📋 Environment
 
 | Component | Version |
 |-----------|---------|
-| **Agent Version** | 7.60.1 |
-| **Helm Chart** | datadog/datadog 3.85.0 |
-| **Platform** | EKS with Bottlerocket |
-| **Bottlerocket Version** | 1.52.0 |
-| **Kubernetes Version** | 1.31+ |
-| **Affected Integrations** | systemd, journald |
+| **Kubernetes** | 1.33 on EKS |
+| **Bottlerocket OS** | 1.52.0 |
+| **Datadog Helm Chart** | 3.85.0 |
+| **Datadog Agent Image** | 7.60.1 |
+| **Cluster Name** | `dd-bottlerocket-repro` |
+| **Region** | `us-east-1` |
 
-## Schema
+---
+
+## 🔴 Reproduced SELinux Denials
+
+### 1. `signull` Denial (Process Checking)
+```
+avc:  denied  { signull } for  pid=33121 comm="kill" 
+  scontext=system_u:system_r:container_t:s0:c133,c439 
+  tcontext=system_u:system_r:container_t:s0:c565,c975 
+  tclass=process permissive=0
+```
+**Impact:** system-probe cannot check if processes in other containers exist (kill -0)
+
+### 2. `search` Denial (Filesystem Access)
+```
+avc:  denied  { search } for  pid=29591 comm="system-probe" name="/" dev="overlay" 
+  scontext=system_u:system_r:container_t:s0:c133,c439 
+  tcontext=system_u:object_r:data_t:s0:c565,c975 
+  tclass=dir permissive=0
+```
+**Impact:** system-probe cannot access other containers' overlay filesystems
+
+### 3. `search` Denial (Secrets Access)
+```
+avc:  denied  { search } for  pid=29591 comm="system-probe" 
+  scontext=system_u:system_r:container_t:s0:c133,c439 
+  tcontext=system_u:object_r:secret_t:s0 
+  tclass=dir permissive=0
+```
+**Impact:** system-probe cannot access Kubernetes secrets directories
+
+---
+
+## 🏗️ Architecture
 
 ```mermaid
-graph TB
-    subgraph "Bottlerocket Node"
-        subgraph "Host Level"
-            K[Linux Kernel<br/>SELinux Enforcing]
-            S[systemd<br/>PID 1]
-            J[journald<br/>/var/log/journal]
-            DBUS[D-Bus Socket]
-        end
+flowchart TB
+    subgraph bottlerocket["🖥️ Bottlerocket Node - SELinux Enforcing"]
+        direction TB
         
-        subgraph "Datadog Agent Pod"
-            A[Agent Container<br/>SELinux: container_t]
-        end
+        sp["🔍 system-probe<br/>container_t:s0:c133,c439"]
+        nginx["🌐 nginx-test<br/>container_t:s0:c565,c975"]
+        coredns["📦 coredns<br/>container_t:s0:cXXX,cYYY"]
         
-        A -->|"❌ DENIED"| DBUS
-        A -->|"❌ DENIED"| J
-        K -->|"Enforces Policy"| A
+        selinux[("🛡️ SELinux<br/>MCS Isolation")]
+        
+        sp -. "❌ signull denied" .-> nginx
+        sp -. "❌ search denied" .-> coredns
+        
+        selinux --> sp
+        selinux --> nginx
+        selinux --> coredns
     end
     
-    style A fill:#ff6b6b
-    style K fill:#ffd93d
+    subgraph fix["✅ After Fix - spc_t"]
+        direction TB
+        sp2["🔍 system-probe<br/>control_t:s0"]
+        nginx2["🌐 nginx-test"]
+        coredns2["📦 coredns"]
+        
+        sp2 -- "✅ signull OK" --> nginx2
+        sp2 -- "✅ search OK" --> coredns2
+    end
+    
+    bottlerocket --> |"Apply seLinuxOptions"| fix
 ```
 
-## Quick Start
+---
+
+## 🚀 Quick Start
 
 ### Prerequisites
+- AWS CLI configured with appropriate permissions
+- `aws-vault` for credential management
+- `kubectl` installed
+- `helm` installed
+- `eksctl` installed
+
+### 0. Authenticate with AWS Vault
 
 ```bash
-# Verify AWS access
-aws-vault exec sso-tse-sandbox-account-admin -- aws sts get-caller-identity
+# Set your AWS profile
+export AWS_PROFILE=sso-tse-sandbox-account-admin
+
+# Login to AWS SSO (opens browser for authentication)
+aws-vault login $AWS_PROFILE
+
+# Verify credentials work
+aws-vault exec $AWS_PROFILE -- aws sts get-caller-identity
+
+# Expected output:
+# {
+#     "UserId": "AROAXXXXXXXXXXXXXXXXX:user@example.com",
+#     "Account": "123456789012",
+#     "Arn": "arn:aws:sts::123456789012:assumed-role/..."
+# }
 ```
 
-### 1. Create EKS Cluster with Bottlerocket
+> **Note:** If your session expires during long operations, re-run `aws-vault login $AWS_PROFILE`
+
+### 1. Create EKS Cluster with Bottlerocket Nodes
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- eksctl create cluster \
+# Set your profile
+export AWS_PROFILE=sso-tse-sandbox-account-admin
+
+# Create cluster
+aws-vault exec $AWS_PROFILE -- eksctl create cluster \
   --name dd-bottlerocket-repro \
   --region us-east-1 \
+  --version 1.31 \
   --nodegroup-name bottlerocket-ng \
   --node-ami-family Bottlerocket \
   --node-type t3.medium \
   --nodes 1 \
   --nodes-min 1 \
-  --nodes-max 1 \
-  --version 1.31
+  --nodes-max 1
 ```
 
-⏱️ **Note:** Cluster creation takes ~15-20 minutes.
-
-**Check cluster creation progress:**
+### 2. Check Cluster Creation Progress
 
 ```bash
-# Check cluster status
-aws-vault exec sso-tse-sandbox-account-admin -- aws eks describe-cluster \
+# Monitor cluster status
+aws-vault exec $AWS_PROFILE -- aws eks describe-cluster \
   --name dd-bottlerocket-repro \
   --region us-east-1 \
-  --query 'cluster.status' \
-  --output text
+  --query 'cluster.status'
 
-# Check CloudFormation stack progress
-aws-vault exec sso-tse-sandbox-account-admin -- aws cloudformation describe-stacks \
-  --stack-name eksctl-dd-bottlerocket-repro-cluster \
-  --region us-east-1 \
-  --query 'Stacks[0].StackStatus' \
-  --output text
-
-# Watch nodegroup creation
-aws-vault exec sso-tse-sandbox-account-admin -- aws eks describe-nodegroup \
-  --cluster-name dd-bottlerocket-repro \
-  --nodegroup-name bottlerocket-ng \
-  --region us-east-1 \
-  --query 'nodegroup.status' \
-  --output text
+# Expected: "ACTIVE"
 ```
 
-### 2. Configure kubectl
+### 3. Install EKS Add-ons (if nodes stuck in NotReady)
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- aws eks update-kubeconfig --name dd-bottlerocket-repro --region us-east-1
+# Install required add-ons
+for addon in vpc-cni coredns kube-proxy; do
+  aws-vault exec $AWS_PROFILE -- aws eks create-addon \
+    --cluster-name dd-bottlerocket-repro \
+    --addon-name $addon \
+    --region us-east-1
+done
+
+# Wait for nodes to be Ready
+aws-vault exec $AWS_PROFILE -- kubectl get nodes -w
 ```
 
-Set up kubectl alias for convenience:
+### 4. Configure kubectl
 
 ```bash
-alias k="aws-vault exec sso-tse-sandbox-account-admin -- kubectl"
-```
-
-### 3. Install Required EKS Add-ons
-
-The cluster needs VPC CNI, CoreDNS, and kube-proxy add-ons for nodes to become Ready:
-
-```bash
-# Install VPC CNI (networking)
-aws-vault exec sso-tse-sandbox-account-admin -- aws eks create-addon \
-  --cluster-name dd-bottlerocket-repro \
-  --addon-name vpc-cni \
-  --region us-east-1
-
-# Install CoreDNS
-aws-vault exec sso-tse-sandbox-account-admin -- aws eks create-addon \
-  --cluster-name dd-bottlerocket-repro \
-  --addon-name coredns \
-  --region us-east-1
-
-# Install kube-proxy
-aws-vault exec sso-tse-sandbox-account-admin -- aws eks create-addon \
-  --cluster-name dd-bottlerocket-repro \
-  --addon-name kube-proxy \
+aws-vault exec $AWS_PROFILE -- aws eks update-kubeconfig \
+  --name dd-bottlerocket-repro \
   --region us-east-1
 ```
 
-Wait ~30 seconds for add-ons to initialize.
-
-### 4. Verify Bottlerocket Node
+### 5. Deploy Datadog Agent WITHOUT seLinuxOptions
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl get nodes -o wide
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl describe node | grep -A5 "System Info"
-```
+# Create namespace and secret
+aws-vault exec $AWS_PROFILE -- kubectl create namespace datadog
+aws-vault exec $AWS_PROFILE -- kubectl create secret generic datadog-secret \
+  --from-literal=api-key=YOUR_API_KEY \
+  -n datadog
 
-Expected output should show:
-- OS Image: `Bottlerocket OS 1.52.0 (aws-k8s-1.31)`
-- Container Runtime: `containerd://1.7.29+bottlerocket`
-- Status: `Ready`
+# Add Helm repo
+helm repo add datadog https://helm.datadoghq.com
+helm repo update
 
-### 5. Deploy Datadog Agent WITHOUT SELinux Options (Reproduce Issue)
-
-Create namespace and secret:
-
-```bash
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl create namespace datadog
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl create secret generic datadog-secret -n datadog --from-literal=api-key=$DD_API_KEY
-```
-
-Create `values-no-selinux.yaml`:
-
-```yaml
+# Create values file WITHOUT seLinuxOptions
+cat > /tmp/values-no-selinux.yaml << 'EOF'
 datadog:
   site: "datadoghq.com"
   apiKeyExistingSecret: "datadog-secret"
@@ -170,134 +197,76 @@ datadog:
   logs:
     enabled: true
     containerCollectAll: true
+  networkMonitoring:
+    enabled: true
+  serviceMonitoring:
+    enabled: true  # USM needs cross-container access
   processAgent:
     enabled: true
     processCollection: true
-  systemProbe:
-    enabled: true
-    enableTCPQueueLength: false
-    enableOOMKill: true
-    collectDNSStats: false
 
-# systemd check configuration
-confd:
-  systemd.yaml: |-
-    init_config:
-    instances:
-      - unit_names:
-          - kubelet.service
-          - containerd.service
-          - chronyd.service
-
-# journald log collection
-confd:
-  journald.yaml: |-
-    logs:
-      - type: journald
-        path: /var/log/journal/
-        source: journald
+systemProbe:
+  enableTCPQueueLength: true
+  enableOOMKill: true
+  collectDNSStats: true
 
 agents:
   image:
     tag: 7.60.1
-  
-  # Mount journald
-  volumes:
-    - name: journald
-      hostPath:
-        path: /var/log/journal/
-    - name: machineid
-      hostPath:
-        path: /etc/machine-id
-  
-  volumeMounts:
-    - name: journald
-      mountPath: /var/log/journal/
-      readOnly: true
-    - name: machineid
-      mountPath: /etc/machine-id
-      readOnly: true
-
-  # NO seLinuxOptions - this will cause the issue
-  # podSecurity:
-  #   seLinuxContext:
-  #     seLinuxOptions:
-  #       user: "system_u"
-  #       role: "system_r"
-  #       type: "spc_t"
-  #       level: "s0"
+  # NO seLinuxOptions - will trigger denials
 
 clusterAgent:
   enabled: true
+EOF
+
+# Deploy
+aws-vault exec $AWS_PROFILE -- helm install datadog-agent datadog/datadog \
+  -n datadog -f /tmp/values-no-selinux.yaml
 ```
 
-Deploy:
+### 6. Deploy Test Workload
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- helm repo add datadog https://helm.datadoghq.com
-aws-vault exec sso-tse-sandbox-account-admin -- helm repo update
-aws-vault exec sso-tse-sandbox-account-admin -- helm upgrade --install datadog-agent datadog/datadog -n datadog -f values-no-selinux.yaml
+aws-vault exec $AWS_PROFILE -- kubectl run nginx-test --image=nginx --restart=Never
 ```
 
-### 6. Wait for Agent Ready
+### 7. Reproduce SELinux Denial
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl wait --for=condition=ready pod -l app=datadog-agent -n datadog --timeout=300s
+# Check system-probe's SELinux context
+aws-vault exec $AWS_PROFILE -- kubectl exec -n datadog daemonset/datadog-agent \
+  -c system-probe -- cat /proc/self/attr/current
+# Expected: system_u:system_r:container_t:s0:cXXX,cYYY
+
+# Try to signal nginx process (will fail)
+NGINX_PID=$(aws-vault exec $AWS_PROFILE -- kubectl exec -n datadog daemonset/datadog-agent \
+  -c system-probe -- ps aux | grep "nginx: master" | awk '{print $2}')
+aws-vault exec $AWS_PROFILE -- kubectl exec -n datadog daemonset/datadog-agent \
+  -c system-probe -- kill -0 $NGINX_PID
+# Expected: kill: (XXXXX): Permission denied
+
+# Check dmesg on Bottlerocket host via SSM
+INSTANCE_ID=$(aws-vault exec $AWS_PROFILE -- aws ec2 describe-instances \
+  --region us-east-1 \
+  --filters "Name=tag:eks:nodegroup-name,Values=bottlerocket-ng*" \
+  --query 'Reservations[*].Instances[*].InstanceId' --output text)
+
+aws-vault exec $AWS_PROFILE -- aws ssm send-command \
+  --region us-east-1 \
+  --instance-ids $INSTANCE_ID \
+  --document-name "AWS-RunShellScript" \
+  --parameters '{"commands":["apiclient exec admin dmesg 2>&1 | grep -i avc | tail -20"]}'
+# Expected: avc: denied { signull } ... comm="system-probe" ...
 ```
 
-## Test Commands
+---
 
-### Verify SELinux Error
+## ✅ Workaround: Apply seLinuxOptions
 
-```bash
-# Check agent status - systemd check should show ERROR
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent status | grep -A20 "systemd"
-
-# Check agent logs for SELinux errors
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl logs -n datadog -l app=datadog-agent -c agent | grep -i selinux
-
-# Run systemd check manually
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent check systemd
-```
-
-### Verify Container SELinux Context
-
-```bash
-# Get the agent pod name
-POD=$(aws-vault exec sso-tse-sandbox-account-admin -- kubectl get pods -n datadog -l app=datadog-agent -o jsonpath='{.items[0].metadata.name}')
-
-# Check the SELinux context (should show container_t or similar restricted type)
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl exec -n datadog $POD -c agent -- cat /proc/self/attr/current
-```
-
-## Expected vs Actual
-
-| Behavior | Expected (with fix) | Actual (without fix) |
-|----------|---------------------|----------------------|
-| systemd check | ✅ Collects unit metrics | ❌ `SELinux policy denies access: Permission denied` |
-| journald logs | ✅ Logs collected | ❌ Cannot read journal files |
-| SELinux context | `system_u:system_r:spc_t:s0` | `system_u:system_r:container_t:s0:c...` |
-
-### Screenshots
-
-**Agent Status - systemd check ERROR:**
-```
-systemd
--------
-  Instance ID: systemd:7461a44c554ac620 [ERROR]
-  Configuration Source: file:/etc/datadog-agent/conf.d/systemd.yaml
-  Total Runs: 2,755
-  Metric Samples: Last Run: 0, Total: 0
-  Error: error getting list of units: SELinux policy denies access: Permission denied
-```
-
-## Fix / Workaround
-
-### Apply SELinux Options
-
-Create `values-with-selinux.yaml`:
+### Verified Working Configuration
 
 ```yaml
+# values-with-selinux.yaml
 datadog:
   site: "datadoghq.com"
   apiKeyExistingSecret: "datadog-secret"
@@ -307,153 +276,132 @@ datadog:
   logs:
     enabled: true
     containerCollectAll: true
+  networkMonitoring:
+    enabled: true
+  serviceMonitoring:
+    enabled: true
   processAgent:
     enabled: true
     processCollection: true
-  systemProbe:
-    enabled: true
-    enableTCPQueueLength: false
-    enableOOMKill: true
-    collectDNSStats: false
+  
+  # ⚠️ CORRECT PATH: datadog.securityContext.seLinuxOptions
+  securityContext:
+    seLinuxOptions:
+      user: "system_u"
+      role: "system_r"
+      type: "spc_t"  # Super Privileged Container
+      level: "s0"
 
-# systemd check configuration  
-confd:
-  systemd.yaml: |-
-    init_config:
-    instances:
-      - unit_names:
-          - kubelet.service
-          - containerd.service
-          - chronyd.service
-
-# journald log collection
-confd:
-  journald.yaml: |-
-    logs:
-      - type: journald
-        path: /var/log/journal/
-        source: journald
+systemProbe:
+  enableTCPQueueLength: true
+  enableOOMKill: true
+  collectDNSStats: true
 
 agents:
   image:
     tag: 7.60.1
-  
-  # Mount journald
-  volumes:
-    - name: journald
-      hostPath:
-        path: /var/log/journal/
-    - name: machineid
-      hostPath:
-        path: /etc/machine-id
-  
-  volumeMounts:
-    - name: journald
-      mountPath: /var/log/journal/
-      readOnly: true
-    - name: machineid
-      mountPath: /etc/machine-id
-      readOnly: true
-
-  # ✅ FIX: Add SELinux options for Bottlerocket
-  podSecurity:
-    seLinuxContext:
-      seLinuxOptions:
-        user: "system_u"
-        role: "system_r"
-        type: "spc_t"  # Super Privileged Container - allows host access
-        level: "s0"
 
 clusterAgent:
   enabled: true
 ```
 
-Apply the fix:
+> **Note:** The correct Helm path is `datadog.securityContext.seLinuxOptions`, NOT `agents.podSecurity.seLinuxContext`
+
+### Apply the Fix
 
 ```bash
-aws-vault exec sso-tse-sandbox-account-admin -- helm upgrade --install datadog-agent datadog/datadog -n datadog -f values-with-selinux.yaml
-```
+# Create values file
+cat > /tmp/values-with-selinux.yaml << 'EOF'
+datadog:
+  site: "datadoghq.com"
+  apiKeyExistingSecret: "datadog-secret"
+  clusterName: "bottlerocket-repro"
+  securityContext:
+    seLinuxOptions:
+      user: "system_u"
+      role: "system_r"
+      type: "spc_t"
+      level: "s0"
+  # ... rest of your config
+EOF
 
-### Verify Fix
+# Upgrade with seLinuxOptions
+aws-vault exec $AWS_PROFILE -- helm upgrade datadog-agent datadog/datadog \
+  -n datadog -f /tmp/values-with-selinux.yaml
 
-```bash
 # Wait for rollout
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl rollout status daemonset/datadog-agent -n datadog
+aws-vault exec $AWS_PROFILE -- kubectl rollout status daemonset/datadog-agent -n datadog
 
-# Check systemd check now works
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl exec -n datadog daemonset/datadog-agent -c agent -- agent check systemd
+# Verify new SELinux context (no MCS labels)
+aws-vault exec $AWS_PROFILE -- kubectl exec -n datadog daemonset/datadog-agent \
+  -c system-probe -- cat /proc/self/attr/current
+# Expected: system_u:system_r:control_t:s0
 
-# Verify SELinux context changed
-POD=$(aws-vault exec sso-tse-sandbox-account-admin -- kubectl get pods -n datadog -l app=datadog-agent -o jsonpath='{.items[0].metadata.name}')
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl exec -n datadog $POD -c agent -- cat /proc/self/attr/current
-# Should show: system_u:system_r:spc_t:s0
+# Verify signull now works
+NGINX_PID=$(aws-vault exec $AWS_PROFILE -- kubectl exec -n datadog daemonset/datadog-agent \
+  -c system-probe -- ps aux | grep "nginx: master" | awk '{print $2}')
+aws-vault exec $AWS_PROFILE -- kubectl exec -n datadog daemonset/datadog-agent \
+  -c system-probe -- kill -0 $NGINX_PID
+# Expected: No output (exit code 0 = success)
 ```
 
-## Alternative SELinux Types
+### Verification Results
 
-| Type | Description | Use Case |
-|------|-------------|----------|
-| `spc_t` | Super Privileged Container | Standard fix, widely recognized |
-| `super_t` | Bottlerocket-specific super type | Alternative for Bottlerocket |
-| `container_t` | Default container type | ❌ Too restrictive for host access |
+| Test | Before Fix | After Fix |
+|------|------------|-----------|
+| `kill -0` (signull) | ❌ Permission denied | ✅ OK |
+| `/proc/<pid>/status` | ❌ Permission denied | ✅ OK |
+| SELinux context | `container_t:s0:cXXX,cYYY` | `control_t:s0` |
 
-## Troubleshooting
+---
 
-### Node Stuck in NotReady
+## 🔒 Security Considerations
 
-If the node stays in `NotReady` status with CNI errors:
+| SELinux Type | Cross-Container Access | Security Level | Use Case |
+|--------------|------------------------|----------------|----------|
+| `container_t` | ❌ Denied | 🟢 High | Standard containers |
+| `spc_t` | ✅ Allowed | 🔴 Low | Monitoring agents needing host access |
+| `super_t` | ✅ Allowed | 🔴 Low | Bottlerocket-specific privileged |
 
-```bash
-# Check node conditions
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl describe node | grep -A5 "Conditions:"
+**Trade-off:** Using `spc_t` grants system-probe broad access to host resources, which is required for:
+- Network Performance Monitoring (NPM)
+- Universal Service Monitoring (USM)
+- OOM Kill detection
+- Process collection
 
-# Verify add-ons are installed
-aws-vault exec sso-tse-sandbox-account-admin -- aws eks list-addons --cluster-name dd-bottlerocket-repro --region us-east-1
+---
 
-# If add-ons are missing, install them (see step 3)
-```
-
-### Datadog Agent Issues
-
-```bash
-# Pod logs
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl logs -n datadog -l app=datadog-agent -c agent --tail=100 | grep -i selinux
-
-# Describe pod (check security context)
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl get pod -n datadog -l app=datadog-agent -o yaml | grep -A10 securityContext
-
-# Get events
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl get events -n datadog --sort-by='.lastTimestamp'
-
-# Check Bottlerocket SELinux status (via SSM if available)
-# SELinux is always enforcing on Bottlerocket - cannot be disabled
-
-# Verify mounts
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl exec -n datadog daemonset/datadog-agent -c agent -- ls -la /var/log/journal/
-```
-
-## Cleanup
+## 🧹 Cleanup
 
 ```bash
 # Delete Datadog agent
-aws-vault exec sso-tse-sandbox-account-admin -- kubectl delete namespace datadog
+aws-vault exec $AWS_PROFILE -- helm uninstall datadog-agent -n datadog
 
-# Delete EKS cluster
-aws-vault exec sso-tse-sandbox-account-admin -- eksctl delete cluster --name dd-bottlerocket-repro --region us-east-1
+# Delete test pod
+aws-vault exec $AWS_PROFILE -- kubectl delete pod nginx-test
+
+# Delete cluster
+aws-vault exec $AWS_PROFILE -- eksctl delete cluster \
+  --name dd-bottlerocket-repro \
+  --region us-east-1
 ```
 
-## Key Takeaways
+---
 
-1. **Bottlerocket enforces SELinux by default** - unlike Amazon Linux 2 or Ubuntu
-2. **The Helm chart supports SELinux options** but they're not enabled by default
-3. **`spc_t` (Super Privileged Container)** is required for host systemd/journald access
-4. **This is a configuration issue, not a bug** - the fix is adding the correct values
+## 📚 References
 
-## References
+- [Datadog Agent SELinux Configuration](https://docs.datadoghq.com/containers/kubernetes/installation/?tab=helm#unprivileged)
+- [Bottlerocket SELinux Documentation](https://github.com/bottlerocket-os/bottlerocket/blob/develop/SECURITY_GUIDANCE.md#selinux)
+- [Kubernetes SELinux Context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#assign-selinux-labels-to-a-container)
 
-- [Datadog Kubernetes Agent Installation](https://docs.datadoghq.com/containers/kubernetes/installation/)
-- [Datadog systemd Integration](https://docs.datadoghq.com/integrations/systemd/)
-- [Datadog journald Integration](https://docs.datadoghq.com/integrations/journald/)
-- [Bottlerocket Security Features](https://bottlerocket.dev/en/os/latest/#/concepts/security/)
-- [AWS EKS Bottlerocket](https://docs.aws.amazon.com/eks/latest/userguide/eks-optimized-ami-bottlerocket.html)
-- [SELinux and Containers](https://www.redhat.com/en/topics/linux/what-is-selinux)
+---
+
+## 📝 Reproduction Log
+
+**Date:** 2026-01-15  
+**Reproduced by:** Alexandre VEA
+
+### Verified Denials
+- ✅ `signull` denial reproduced
+- ✅ `search` on overlay directories reproduced
+- ✅ `search` on secret_t reproduced
