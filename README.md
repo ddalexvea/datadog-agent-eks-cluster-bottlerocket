@@ -9,8 +9,6 @@ Error running check: error getting list of units: SELinux policy denies access: 
 
 Bottlerocket enforces SELinux by default. Without explicit `seLinuxOptions` in the pod spec, the agent container cannot access host systemd D-Bus socket or journald files.
 
-**Related Tickets:** 2417402
-
 ## Environment
 
 | Component | Version |
