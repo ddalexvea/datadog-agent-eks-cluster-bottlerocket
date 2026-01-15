@@ -357,17 +357,58 @@ aws-vault exec $AWS_PROFILE -- kubectl exec -n datadog daemonset/datadog-agent \
 
 ## 🔒 Security Considerations
 
+### When to Configure seLinuxOptions?
+
+| Scenario | Who Configures | Why |
+|----------|----------------|-----|
+| Standard Linux (no SELinux) | Nobody | SELinux not enforcing |
+| RHEL/Amazon Linux with SELinux | Helm chart handles it | Default policies usually work |
+| **Bottlerocket with SELinux** | **You must configure** | Bottlerocket enforces stricter MCS isolation |
+
+> **Key insight:** The Helm chart doesn't auto-detect Bottlerocket. You must explicitly add `seLinuxOptions` in your values file.
+
+### What You Lose WITHOUT seLinuxOptions on Bottlerocket
+
+| Feature | Status | Reason |
+|---------|--------|--------|
+| **systemd integration** | ❌ Broken | Can't access D-Bus socket (`secret_t` access denied) |
+| **journald logs** | ❌ Broken | Can't read journal files |
+| **USM (Universal Service Monitoring)** | ⚠️ Degraded | Can't inspect processes in other containers |
+| **NPM process correlation** | ⚠️ Degraded | Can't map network flows to container PIDs |
+| **Full process collection** | ⚠️ Degraded | Can't read `/proc/<pid>` of other containers |
+| **OOM Kill detection** | ✅ Works | Uses eBPF (kernel-level, no cross-container) |
+| **Container logs** | ✅ Works | Reads from mounted container log paths |
+| **Metrics (CPU, memory, etc.)** | ✅ Works | Uses kubelet/cAdvisor APIs |
+| **APM traces** | ✅ Works | Receives traces via network |
+| **Live Processes** | ✅ Works | Reads own container's `/proc` |
+
+### SELinux Type Comparison
+
 | SELinux Type | Cross-Container Access | Security Level | Use Case |
 |--------------|------------------------|----------------|----------|
-| `container_t` | ❌ Denied | 🟢 High | Standard containers |
-| `spc_t` | ✅ Allowed | 🔴 Low | Monitoring agents needing host access |
-| `super_t` | ✅ Allowed | 🔴 Low | Bottlerocket-specific privileged |
+| `container_t` | ❌ Denied (MCS isolation) | 🟢 High | Standard containers |
+| `spc_t` | ✅ Allowed | 🟡 Medium | Monitoring agents needing host access |
+| `super_t` | ✅ Allowed | 🟡 Medium | Bottlerocket-specific privileged |
 
-**Trade-off:** Using `spc_t` grants system-probe broad access to host resources, which is required for:
-- Network Performance Monitoring (NPM)
-- Universal Service Monitoring (USM)
-- OOM Kill detection
-- Process collection
+### Trade-off Decision
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Do you need these features?                  │
+├─────────────────────────────────────────────────────────────────┤
+│  • systemd metrics                                              │
+│  • Full USM (Universal Service Monitoring)                      │
+│  • Full NPM process correlation                                 │
+│  • Cross-container process inspection                           │
+├─────────────────────────────────────────────────────────────────┤
+│         YES                              NO                     │
+│          ↓                                ↓                     │
+│   Add seLinuxOptions              Keep default container_t      │
+│   (spc_t or super_t)              (more secure, less features)  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+> **Note:** `spc_t` and `super_t` are functionally equivalent on Bottlerocket. Use `spc_t` for cross-platform compatibility.
 
 ---
 
