@@ -9,6 +9,8 @@ Error running check: error getting list of units: SELinux policy denies access: 
 
 Bottlerocket enforces SELinux by default. Without explicit `seLinuxOptions` in the pod spec, the agent container cannot access host systemd D-Bus socket or journald files.
 
+**Related Tickets:** 2417402
+
 ## Environment
 
 | Component | Version |
@@ -109,7 +111,33 @@ Set up kubectl alias for convenience:
 alias k="aws-vault exec sso-tse-sandbox-account-admin -- kubectl"
 ```
 
-### 3. Verify Bottlerocket Node
+### 3. Install Required EKS Add-ons
+
+The cluster needs VPC CNI, CoreDNS, and kube-proxy add-ons for nodes to become Ready:
+
+```bash
+# Install VPC CNI (networking)
+aws-vault exec sso-tse-sandbox-account-admin -- aws eks create-addon \
+  --cluster-name dd-bottlerocket-repro \
+  --addon-name vpc-cni \
+  --region us-east-1
+
+# Install CoreDNS
+aws-vault exec sso-tse-sandbox-account-admin -- aws eks create-addon \
+  --cluster-name dd-bottlerocket-repro \
+  --addon-name coredns \
+  --region us-east-1
+
+# Install kube-proxy
+aws-vault exec sso-tse-sandbox-account-admin -- aws eks create-addon \
+  --cluster-name dd-bottlerocket-repro \
+  --addon-name kube-proxy \
+  --region us-east-1
+```
+
+Wait ~30 seconds for add-ons to initialize.
+
+### 4. Verify Bottlerocket Node
 
 ```bash
 aws-vault exec sso-tse-sandbox-account-admin -- kubectl get nodes -o wide
@@ -117,10 +145,11 @@ aws-vault exec sso-tse-sandbox-account-admin -- kubectl describe node | grep -A5
 ```
 
 Expected output should show:
-- OS Image: `Bottlerocket OS 1.x.x`
-- Container Runtime: `containerd://`
+- OS Image: `Bottlerocket OS 1.52.0 (aws-k8s-1.31)`
+- Container Runtime: `containerd://1.7.29+bottlerocket`
+- Status: `Ready`
 
-### 4. Deploy Datadog Agent WITHOUT SELinux Options (Reproduce Issue)
+### 5. Deploy Datadog Agent WITHOUT SELinux Options (Reproduce Issue)
 
 Create namespace and secret:
 
@@ -210,7 +239,7 @@ aws-vault exec sso-tse-sandbox-account-admin -- helm repo update
 aws-vault exec sso-tse-sandbox-account-admin -- helm upgrade --install datadog-agent datadog/datadog -n datadog -f values-no-selinux.yaml
 ```
 
-### 5. Wait for Agent Ready
+### 6. Wait for Agent Ready
 
 ```bash
 aws-vault exec sso-tse-sandbox-account-admin -- kubectl wait --for=condition=ready pod -l app=datadog-agent -n datadog --timeout=300s
@@ -369,6 +398,22 @@ aws-vault exec sso-tse-sandbox-account-admin -- kubectl exec -n datadog $POD -c 
 | `container_t` | Default container type | ❌ Too restrictive for host access |
 
 ## Troubleshooting
+
+### Node Stuck in NotReady
+
+If the node stays in `NotReady` status with CNI errors:
+
+```bash
+# Check node conditions
+aws-vault exec sso-tse-sandbox-account-admin -- kubectl describe node | grep -A5 "Conditions:"
+
+# Verify add-ons are installed
+aws-vault exec sso-tse-sandbox-account-admin -- aws eks list-addons --cluster-name dd-bottlerocket-repro --region us-east-1
+
+# If add-ons are missing, install them (see step 3)
+```
+
+### Datadog Agent Issues
 
 ```bash
 # Pod logs
